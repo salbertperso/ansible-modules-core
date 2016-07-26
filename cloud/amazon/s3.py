@@ -43,6 +43,7 @@ options:
   dest:
     description:
       - The destination file path when downloading an object/key with a GET operation.
+      - The destination folder path when downloading objects/keys with a GET recursive operation. Only with the recurse parameter "true"
     required: false
     aliases: []
     version_added: "1.3"
@@ -100,9 +101,15 @@ options:
     version_added: "2.0"
   prefix:
     description:
-      - Limits the response to keys that begin with the specified prefix for list mode
+      - Limits to keys that begin with the specified prefix for list, get, put and delobj mode
     required: false
     default: null
+    version_added: "2.0"
+  recurse:
+    description:
+      - Get, Put or Delete all keys that begin with the specified prefix for get, put or delobj mode
+    required: false
+    default: false
     version_added: "2.0"
   version:
     description:
@@ -137,6 +144,7 @@ options:
   src:
     description:
       - The source file path when performing a PUT operation.
+      - The source folder path when performing a PUT recursive operation. Only with the recurse parameter "true"
     required: false
     default: null
     aliases: []
@@ -158,11 +166,17 @@ EXAMPLES = '''
 # Get a specific version of an object.
 - s3: bucket=mybucket object=/my/desired/key.txt version=48c9ee5131af7a716edc22df9772aa6f dest=/usr/local/myfile.txt mode=get
 
+# Get all object with prefix key
+- s3: bucket=mybucket prefix=/my/desired dest=/usr/local recurse=true mode=get
+
 # PUT/upload with metadata
 - s3: bucket=mybucket object=/my/desired/key.txt src=/usr/local/myfile.txt mode=put metadata='Content-Encoding=gzip,Cache-Control=no-cache'
 
 # PUT/upload with custom headers
 - s3: bucket=mybucket object=/my/desired/key.txt src=/usr/local/myfile.txt mode=put headers=x-amz-grant-full-control=emailAddress=owner@example.com
+
+# Put all object with prefix key
+- s3: bucket=mybucket prefix=/my/desired src=/usr/local recurse=true mode=put
 
 # List keys simple
 - s3: bucket=mybucket mode=list
@@ -184,11 +198,17 @@ EXAMPLES = '''
 
 # Delete an object from a bucket
 - s3: bucket=mybucket object=/my/desired/key.txt mode=delobj
+
+# Delete all objects from a bucket with prefix
+- s3: bucket=mybucket prefix=/my/desired recurse=true mode=delobj
+
 '''
 
 import os
 import urlparse
 from ssl import SSLError
+import re
+from datetime import date
 
 try:
     import boto
@@ -197,14 +217,22 @@ try:
     from boto.s3.connection import OrdinaryCallingFormat
     from boto.s3.connection import S3Connection
     from boto.s3.acl import CannedACLStrings
+    from boto.dynamodb2.results import ResultSet
+
     HAS_BOTO = True
 except ImportError:
     HAS_BOTO = False
 
-def key_check(module, s3, bucket, obj, version=None):
+DEFAULT_MAX_KEYS = 1000
+
+def key_check(module, s3, bucket, obj, recurse, version=None, marker=None, max_keys=DEFAULT_MAX_KEYS):
     try:
         bucket = s3.lookup(bucket)
-        key_check = bucket.get_key(obj, version_id=version)
+
+        if recurse:
+            key_check = bucket.get_all_keys(prefix=obj, max_keys=max_keys, marker=marker)
+        else:
+            key_check = bucket.get_key(obj, version_id=version)
     except s3.provider.storage_response_error as e:
         if version is not None and e.status == 400: # If a specified version doesn't exist a 400 is returned.
             key_check = None
@@ -215,16 +243,30 @@ def key_check(module, s3, bucket, obj, version=None):
     else:
         return False
 
-def keysum(module, s3, bucket, obj, version=None):
-    bucket = s3.lookup(bucket)
-    key_check = bucket.get_key(obj, version_id=version)
-    if not key_check:
+def keysum(module, s3, bucket, obj, recurse, version=None, marker=None, max_keys=DEFAULT_MAX_KEYS):
+    if recurse:
+        bucket = s3.lookup(bucket)
+
+        rskeys = bucket.get_all_keys(prefix=obj, marker=marker, max_keys=max_keys)
+    else:
+        rskeys = ResultSet()
+        rskeys.to_call(get_resultset_onekey, s3, bucket, obj, version=version)
+
+    dict_md5_remote = {}
+
+    for key_check in rskeys:
+
+        md5_remote = key_check.etag[1:-1]
+        etag_multipart = '-' in md5_remote # Check for multipart, etag is not md5
+        if etag_multipart is True:
+            module.fail_json(msg="Files uploaded with multipart of s3 are not supported with checksum, unable to compute checksum.")
+
+        dict_md5_remote.update({ key_check.name: md5_remote })
+
+    if len(dict_md5_remote) > 0:
+        return dict_md5_remote
+    else:
         return None
-    md5_remote = key_check.etag[1:-1]
-    etag_multipart = '-' in md5_remote # Check for multipart, etag is not md5
-    if etag_multipart is True:
-        module.fail_json(msg="Files uploaded with multipart of s3 are not supported with checksum, unable to compute checksum.")
-    return md5_remote
 
 def bucket_check(module, s3, bucket):
     try:
@@ -271,11 +313,25 @@ def delete_bucket(module, s3, bucket):
     except s3.provider.storage_response_error as e:
         module.fail_json(msg= str(e))
 
-def delete_key(module, s3, bucket, obj):
+def delete_key(module, s3, bucket, obj, recurse=False, marker=None, max_keys=DEFAULT_MAX_KEYS):
     try:
         bucket = s3.lookup(bucket)
-        bucket.delete_key(obj)
-        module.exit_json(msg="Object deleted from bucket %s"%bucket, changed=True)
+
+        if recurse:
+            keys_name = []
+            keys = bucket.get_all_keys(prefix=obj, marker=marker, max_keys=max_keys)
+
+            for key in keys: keys_name.append(key.name)
+
+            if len(keys_name) > 0:
+                bucket.delete_keys(keys_name)
+                module.exit_json(msg="Objects deleted from bucket %s"%bucket, files=keys_name, changed=True)
+            else:
+                module.exit_json(msg="No objects found in bucket %s"%bucket, obj=obj, changed=True)
+        else:
+            bucket.delete_key(obj)
+            module.exit_json(msg="Object deleted from bucket %s"%bucket, files=obj, changed=True)
+
     except s3.provider.storage_response_error as e:
         module.fail_json(msg= str(e))
 
@@ -295,8 +351,12 @@ def path_check(path):
         return False
 
 
-def upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers):
+def upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers, return_upload_files=None, next_upload_s3file=False):
+    if return_upload_files is None:
+        return_upload_files = []
+
     try:
+
         bucket = s3.lookup(bucket)
         key = bucket.new_key(obj)
         if metadata:
@@ -307,27 +367,62 @@ def upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, heade
         for acl in module.params.get('permission'):
             key.set_acl(acl)
         url = key.generate_url(expiry)
-        module.exit_json(msg="PUT operation complete", url=url, changed=True)
+        return_upload_files.append({ 'obj': obj, 'upload': True, 'url': url, 'expiry': expiry, 'src': src })
+
+        if not next_upload_s3file:
+            module.exit_json(msg="PUT operation complete", files=return_upload_files, changed=True)
+        else:
+            return return_upload_files
+
     except s3.provider.storage_copy_error as e:
         module.fail_json(msg= str(e))
 
-def download_s3file(module, s3, bucket, obj, dest, retries, version=None):
-    # retries is the number of loops; range/xrange needs to be one
-    # more to get that count of loops.
-    bucket = s3.lookup(bucket)
-    key = bucket.get_key(obj, version_id=version)
-    for x in range(0, retries + 1):
-        try:
-            key.get_contents_to_filename(dest)
-            module.exit_json(msg="GET operation complete", changed=True)
-        except s3.provider.storage_copy_error as e:
-            module.fail_json(msg= str(e))
-        except SSLError as e:
-            # actually fail on last pass through the loop.
-            if x >= retries:
-                module.fail_json(msg="s3 download failed; %s" % e)
-            # otherwise, try again, this may be a transient timeout.
-            pass
+def download_s3file(module, s3, bucket, obj, recurse, dest, retries, version=None, marker=None, max_keys=DEFAULT_MAX_KEYS, return_download_files=None, next_download_s3file=False):
+    if return_download_files is None:
+        return_download_files = []
+
+    if recurse:
+        bucket = s3.lookup(bucket)
+        rskeys = bucket.get_all_keys(prefix=obj, marker=marker, max_keys=max_keys)
+    else:
+        rskeys = ResultSet()
+        rskeys.to_call(get_resultset_onekey, s3, bucket, obj, version=version)
+
+    download_keys = False
+
+    for key in rskeys:
+      # retries is the number of loops; range/xrange needs to be one
+      # more to get that count of loops.
+      for x in range(0, retries + 1):
+          try:
+              local_path = key_local_path(obj, key.name, dest)
+              if not path_check(local_path):
+                 os.makedirs(local_path, mode=0744)
+
+              if recurse:
+                  local_file=os.path.join(local_path,os.path.basename(key.name))
+              else:
+                  local_file=os.path.join(dest)
+
+              key.get_contents_to_filename(local_file)
+              return_download_files.append({ 'obj': key.name, 'download': True, 'dest': local_file})
+              download_keys = True
+
+          except s3.provider.storage_copy_error as e:
+              module.fail_json(msg= str(e))
+          except SSLError as e:
+              # actually fail on last pass through the loop.
+              if x >= retries:
+                  module.fail_json(msg="s3 download failed; %s" % e)
+              # otherwise, try again, this may be a transient timeout.
+              pass
+
+    if download_keys and not next_download_s3file:
+       module.exit_json(msg="GET operation complete", files=return_download_files, changed=True)
+    elif not next_download_s3file:
+       module.exit_json(msg="GET operation complete, no keys downloaded", changed=False)
+    else:
+        return return_download_files
 
 def download_s3str(module, s3, bucket, obj, version=None):
     try:
@@ -338,12 +433,23 @@ def download_s3str(module, s3, bucket, obj, version=None):
     except s3.provider.storage_copy_error as e:
         module.fail_json(msg= str(e))
 
-def get_download_url(module, s3, bucket, obj, expiry, changed=True):
+def get_download_url(module, s3, bucket, obj, expiry, changed=True, listFiles=None, next_download_url=False):
+    if listFiles is None:
+        listFiles = []
+
+
+
     try:
         bucket = s3.lookup(bucket)
         key = bucket.lookup(obj)
         url = key.generate_url(expiry)
-        module.exit_json(msg="Download url:", url=url, expiry=expiry, changed=changed)
+        listFiles.append({ 'obj': obj, 'upload': False, 'url': url, 'expiry': expiry })
+        if not next_download_url:
+
+            module.exit_json(msg="Download url:", files=listFiles, changed=changed)
+        else:
+
+            return listFiles
     except s3.provider.storage_response_error as e:
         module.fail_json(msg= str(e))
 
@@ -364,6 +470,34 @@ def is_walrus(s3_url):
     else:
         return False
 
+def get_resultset_onekey(s3, bucket, obj, version=None):
+    bucket = s3.lookup(bucket)
+    onekey = bucket.get_key(obj, version_id=version)
+    return { 'results': [ onekey ] }
+
+def key_local_path(obj, key_name, dest):
+
+    if os.path.split(dest)[1] == '':
+        key_path = os.path.dirname(key_name)
+        key_path = key_path.replace(obj,'')
+
+        key_path = os.path.join(dest,re.sub('^/(.*)', '\\1', key_path))
+    else:
+        key_path = os.path.dirname(dest)
+
+    return key_path
+
+def get_list_files(path, recurse=False):
+    """ Return list files into path directory and subdirectories """
+    fichiers=[]
+
+    if recurse:
+        for root, dirs, files in os.walk(path):
+            for i in files:
+                fichiers.append(os.path.join(root, i))
+    else:
+        fichiers.append(path)
+    return fichiers
 
 def main():
     argument_spec = ec2_argument_spec()
@@ -374,7 +508,7 @@ def main():
             expiry         = dict(default=600, aliases=['expiration']),
             headers        = dict(type='dict'),
             marker         = dict(default=None),
-            max_keys       = dict(default=1000),
+            max_keys       = dict(default=DEFAULT_MAX_KEYS),
             metadata       = dict(type='dict'),
             mode           = dict(choices=['get', 'put', 'delete', 'create', 'geturl', 'getstr', 'delobj', 'list'], required=True),
             object         = dict(),
@@ -385,12 +519,14 @@ def main():
             retries        = dict(aliases=['retry'], type='int', default=0),
             s3_url         = dict(aliases=['S3_URL']),
             src            = dict(),
+            recurse        = dict(default=False, type='bool'),
         ),
     )
     module = AnsibleModule(argument_spec=argument_spec)
 
     if not HAS_BOTO:
         module.fail_json(msg='boto required for this module')
+
 
     bucket = module.params.get('bucket')
     encrypt = module.params.get('encrypt')
@@ -409,6 +545,11 @@ def main():
     retries = module.params.get('retries')
     s3_url = module.params.get('s3_url')
     src = module.params.get('src')
+    recurse = module.params.get('recurse')
+
+    if recurse:
+        if prefix is None:
+            module.fail_json(msg ='Unknown prefix specifed to get, put, delobj recurse mode.')
 
     for acl in module.params.get('permission'):
         if acl not in CannedACLStrings:
@@ -476,6 +617,10 @@ def main():
 
     # If our mode is a GET operation (download), go through the procedure as appropriate ...
     if mode == 'get':
+        if recurse:
+            obj = prefix
+            if not dest[-1:] == '/':
+                dest += '/'
 
         # First, we check to see if the bucket exists, we get "bucket" returned.
         bucketrtn = bucket_check(module, s3, bucket)
@@ -483,45 +628,79 @@ def main():
             module.fail_json(msg="Source bucket cannot be found", failed=True)
 
         # Next, we check to see if the key in the bucket exists. If it exists, it also returns key_matches md5sum check.
-        keyrtn = key_check(module, s3, bucket, obj, version=version)
+        keyrtn = key_check(module, s3, bucket, obj, recurse, version=version, marker=marker, max_keys=max_keys)
         if keyrtn is False:
             if version is not None:
                 module.fail_json(msg="Key %s with version id %s does not exist."% (obj, version), failed=True)
             else:
                 module.fail_json(msg="Key %s does not exist."%obj, failed=True)
 
+
+        download_files = None
+
         # If the destination path doesn't exist or overwrite is True, no need to do the md5um etag check, so just download.
         pathrtn = path_check(dest)
         if pathrtn is False or overwrite == 'always':
-            download_s3file(module, s3, bucket, obj, dest, retries, version=version)
+            download_files = download_s3file(module, s3, bucket, obj, recurse, dest, retries, version=version, marker=marker, max_keys=max_keys, return_download_files=download_files)
 
         # Compare the remote MD5 sum of the object with the local dest md5sum, if it already exists.
         if pathrtn is True:
-            md5_remote = keysum(module, s3, bucket, obj, version=version)
-            md5_local = module.md5(dest)
-            if md5_local == md5_remote:
-                sum_matches = True
-                if overwrite == 'always':
-                    download_s3file(module, s3, bucket, obj, dest, retries, version=version)
-                else:
-                    module.exit_json(msg="Local and remote object are identical, ignoring. Use overwrite=always parameter to force.", changed=False)
-            else:
-                sum_matches = False
+            dict_md5_remote = keysum(module, s3, bucket, obj, recurse, version=version, marker=marker, max_keys=max_keys)
 
-                if overwrite in ('always', 'different'):
-                    download_s3file(module, s3, bucket, obj, dest, retries, version=version)
-                else:
-                    module.exit_json(msg="WARNING: Checksums do not match. Use overwrite parameter to force download.")
+            idx_key = 0
+            download_key = False
 
-        # Firstly, if key_matches is TRUE and overwrite is not enabled, we EXIT with a helpful message.
-        if sum_matches is True and overwrite == 'never':
-            module.exit_json(msg="Local and remote object are identical, ignoring. Use overwrite parameter to force.", changed=False)
+            for key_name, md5_remote in dict_md5_remote.iteritems():
+                idx_key += 1
+                local_dest = dest
+                if os.path.isdir(local_dest):
+                    local_dest = os.path.join(key_local_path(obj, key_name, local_dest), os.path.basename(key_name))
+
+                md5_local = module.md5(local_dest)
+                if idx_key < len(dict_md5_remote):
+                    next_download_s3file = True
+                else:
+                    next_download_s3file = False
+
+                if md5_local == md5_remote:
+                    if overwrite == 'always':
+                        download_files = download_s3file(module, s3, bucket, key_name, False, local_dest, retries, version=version, return_download_files=download_files, next_download_s3file=next_download_s3file)
+                        download_key = True
+                    else:
+                        if download_files is None:
+                            download_files = []
+                        local_path = key_local_path(obj, key_name, local_dest)
+                        if recurse:
+                            local_file=os.path.join(local_path,os.path.basename(key_name))
+                        else:
+                            local_file=os.path.join(local_dest)
+                        download_files.append({ 'obj': key_name, 'download': False, 'dest': local_file})
+
+                        if not next_download_s3file and not download_key:
+                            module.exit_json(msg="Local and remote object are identical, ignoring. Use overwrite=always parameter to force.", files=download_files, changed=False)
+                else:
+                    if overwrite in ('always', 'different'):
+                        download_files = download_s3file(module, s3, bucket, key_name, False, local_dest, retries, version=version, return_download_files=download_files, next_download_s3file=next_download_s3file)
+                        download_key = True
+                    elif not next_download_s3file and not download_key:
+                        module.exit_json(msg="WARNING: Checksums do not match. Use overwrite parameter to force download.")
+
 
     # if our mode is a PUT operation (upload), go through the procedure as appropriate ...
     if mode == 'put':
 
-        # Use this snippet to debug through conditionals:
-#       module.exit_json(msg="Bucket return %s"%bucketrtn)
+       # Use this snippet to debug through conditionals:
+       # module.exit_json(msg="Bucket return %s"%bucketrtn)
+       # sys.exit(0)
+        if src is None:
+            module.fail_json(msg="src parameter is required", failed=True)
+
+        if recurse:
+            obj = prefix
+            if not os.path.isdir(src):
+                module.fail_json(msg="Local object for PUT must be a folder for recurse mode", failed=True)
+        elif not os.path.isfile(src):
+            module.fail_json(msg="Local object for PUT must be a file for not recurse mode", failed=True)
 
         # Lets check the src path.
         pathrtn = path_check(src)
@@ -531,25 +710,47 @@ def main():
         # Lets check to see if bucket exists to get ground truth.
         bucketrtn = bucket_check(module, s3, bucket)
         if bucketrtn is True:
-            keyrtn = key_check(module, s3, bucket, obj)
+            keyrtn = key_check(module, s3, bucket, obj, recurse, version=version, marker=marker, max_keys=max_keys)
 
         # Lets check key state. Does it exist and if it does, compute the etag md5sum.
         if bucketrtn is True and keyrtn is True:
-                md5_remote = keysum(module, s3, bucket, obj)
-                md5_local = module.md5(src)
 
-                if md5_local == md5_remote:
-                    sum_matches = True
-                    if overwrite == 'always':
-                        upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
+                listFiles = get_list_files(src, recurse)
+
+                dict_md5_remote = keysum(module, s3, bucket, obj, recurse, version=version, marker=marker, max_keys=max_keys)
+                idx_file = 0
+                upload_files = None
+                changed=False
+
+                for file in listFiles:
+                    idx_file += 1
+
+                    md5_local = module.md5(file)
+                    remote_file = file.replace(src,obj)
+                    if dict_md5_remote.has_key(remote_file):
+                        md5_remote = dict_md5_remote.get(remote_file)
                     else:
-                        get_download_url(module, s3, bucket, obj, expiry, changed=False)
-                else:
-                    sum_matches = False
-                    if overwrite in ('always', 'different'):
-                        upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
+                        md5_remote = ''
+
+
+
+                    if idx_file < len(listFiles):
+                        next_upload_s3file = True
                     else:
-                        module.exit_json(msg="WARNING: Checksums do not match. Use overwrite parameter to force upload.")
+                        next_upload_s3file = False
+
+                    if md5_local == md5_remote:
+                        if overwrite == 'always':
+                            upload_files = upload_s3file(module, s3, bucket, remote_file, file, expiry, metadata, encrypt, headers, return_upload_files=upload_files, next_upload_s3file=next_upload_s3file)
+                        else:
+                            upload_files = get_download_url(module, s3, bucket, remote_file, expiry, changed=changed, listFiles=upload_files, next_download_url=next_upload_s3file)
+                    else:
+                        if overwrite in ('always', 'different'):
+                            upload_files = upload_s3file(module, s3, bucket, remote_file, file, expiry, metadata, encrypt, headers, return_upload_files=upload_files, next_upload_s3file=next_upload_s3file)
+                            changed=True
+                        else:
+                            module.exit_json(msg="WARNING: Checksums do not match. Use overwrite parameter to force upload.")
+
 
         # If neither exist (based on bucket existence), we can create both.
         if bucketrtn is False and pathrtn is True:
@@ -558,18 +759,33 @@ def main():
 
         # If bucket exists but key doesn't, just upload.
         if bucketrtn is True and pathrtn is True and keyrtn is False:
-            upload_s3file(module, s3, bucket, obj, src, expiry, metadata, encrypt, headers)
+            putFiles = get_list_files(src, recurse)
+            idx_file = 0
+            upload_files = []
+
+            for file in putFiles:
+                idx_file +=1
+
+                if idx_file < len(putFiles):
+                    next_upload_s3file = True
+                else:
+                    next_upload_s3file = False
+
+                remote_file = file.replace(src,obj)
+                upload_files = upload_s3file(module, s3, bucket, remote_file, file, expiry, metadata, encrypt, headers, return_upload_files=upload_files, next_upload_s3file=next_upload_s3file)
 
     # Delete an object from a bucket, not the entire bucket
     if mode == 'delobj':
+        if recurse:
+            obj = prefix
+
         if obj is None:
             module.fail_json(msg="object parameter is required", failed=True);
+
         if bucket:
             bucketrtn = bucket_check(module, s3, bucket)
             if bucketrtn is True:
-                deletertn = delete_key(module, s3, bucket, obj)
-                if deletertn is True:
-                    module.exit_json(msg="Object %s deleted from bucket %s." % (obj, bucket), changed=True)
+                delete_key(module, s3, bucket, obj, recurse=recurse, marker=marker, max_keys=max_keys)
             else:
                 module.fail_json(msg="Bucket does not exist.", changed=False)
         else:
