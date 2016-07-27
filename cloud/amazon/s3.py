@@ -110,7 +110,7 @@ options:
       - Get, Put or Delete all keys that begin with the specified prefix for get, put or delobj mode
     required: false
     default: false
-    version_added: "2.0"
+    version_added: "2.2"
   version:
     description:
       - Version ID of the object inside the bucket. Can be used to get a specific version of a file if versioning is enabled in the target bucket.
